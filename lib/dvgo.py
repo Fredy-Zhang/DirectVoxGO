@@ -450,7 +450,24 @@ def get_rays(H, W, K, c2w, inverse_y, flip_x, flip_y, mode='center'):
     rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
     rays_o = c2w[:3,3].expand(rays_d.shape)
-    return rays_o, rays_d
+
+    '''
+    ZZK: Adding radii calculation process.
+	return the radius of each pixel (800*800)
+    '''
+    # dx = [
+    #     np.sqrt(np.sum((v[:-1, :, :] - v[1:, :, :])**2, -1)) for v in rays_d
+    # ]
+    # dx = [np.concatenate([v, v[-2:-1, :]], 0) for v in dx]
+    # radii = torch.tensor([v[..., None] * 2 / np.sqrt(12) for v in dx])
+    directions = torch.sum(dirs[None, ..., None, :] * c2w[None, None, :3, :3], -1)
+    dx = torch.sqrt(
+        torch.sum((directions[:, :-1, :, :] - directions[:, 1:, :, :]) ** 2, -1))
+    dx = torch.cat([dx, dx[:, -2:-1, :]], 1)
+
+    radii = dx[..., None] * 2 / np.sqrt(12)  # return the radius of each pixel (800*800)
+
+    return rays_o, rays_d, radii
 
 
 def get_rays_np(H, W, K, c2w):
@@ -484,11 +501,13 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
 
 
 def get_rays_of_a_view(H, W, K, c2w, ndc, inverse_y, flip_x, flip_y, mode='center'):
-    rays_o, rays_d = get_rays(H, W, K, c2w, inverse_y=inverse_y, flip_x=flip_x, flip_y=flip_y, mode=mode)
+    import pdb
+    pdb.set_trace()
+    rays_o, rays_d, radii = get_rays(H, W, K, c2w, inverse_y=inverse_y, flip_x=flip_x, flip_y=flip_y, mode=mode)
     viewdirs = rays_d / rays_d.norm(dim=-1, keepdim=True)
     if ndc:
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
-    return rays_o, rays_d, viewdirs
+    return rays_o, rays_d, viewdirs, radii
 
 
 @torch.no_grad()
@@ -505,7 +524,7 @@ def get_training_rays(rgb_tr, train_poses, HW, Ks, ndc, inverse_y, flip_x, flip_
     viewdirs_tr = torch.zeros([len(rgb_tr), H, W, 3], device=rgb_tr.device)
     imsz = [1] * len(rgb_tr)
     for i, c2w in enumerate(train_poses):
-        rays_o, rays_d, viewdirs = get_rays_of_a_view(
+        rays_o, rays_d, viewdirs, radii = get_rays_of_a_view(
                 H=H, W=W, K=K, c2w=c2w, ndc=ndc, inverse_y=inverse_y, flip_x=flip_x, flip_y=flip_y)
         rays_o_tr[i].copy_(rays_o.to(rgb_tr.device))
         rays_d_tr[i].copy_(rays_d.to(rgb_tr.device))
@@ -531,7 +550,7 @@ def get_training_rays_flatten(rgb_tr_ori, train_poses, HW, Ks, ndc, inverse_y, f
     top = 0
     for c2w, img, (H, W), K in zip(train_poses, rgb_tr_ori, HW, Ks):
         assert img.shape[:2] == (H, W)
-        rays_o, rays_d, viewdirs = get_rays_of_a_view(
+        rays_o, rays_d, viewdirs, radii = get_rays_of_a_view(
                 H=H, W=W, K=K, c2w=c2w, ndc=ndc,
                 inverse_y=inverse_y, flip_x=flip_x, flip_y=flip_y)
         n = H * W
@@ -564,7 +583,7 @@ def get_training_rays_in_maskcache_sampling(rgb_tr_ori, train_poses, HW, Ks, ndc
     top = 0
     for c2w, img, (H, W), K in zip(train_poses, rgb_tr_ori, HW, Ks):
         assert img.shape[:2] == (H, W)
-        rays_o, rays_d, viewdirs = get_rays_of_a_view(
+        rays_o, rays_d, viewdirs, radii = get_rays_of_a_view(
                 H=H, W=W, K=K, c2w=c2w, ndc=ndc,
                 inverse_y=inverse_y, flip_x=flip_x, flip_y=flip_y)
         mask = torch.ones(img.shape[:2], device=DEVICE, dtype=torch.bool)

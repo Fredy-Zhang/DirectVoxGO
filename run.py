@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from lib import utils, dvgo
 from lib.load_data import load_data
 
-
 def config_parser():
     '''Define command line arguments
     '''
@@ -78,7 +77,7 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
 
         H, W = HW[i]
         K = Ks[i]
-        rays_o, rays_d, viewdirs = dvgo.get_rays_of_a_view(
+        rays_o, rays_d, viewdirs, radii = dvgo.get_rays_of_a_view(
                 H, W, K, c2w, ndc, inverse_y=render_kwargs['inverse_y'],
                 flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
         keys = ['rgb_marched', 'disp']
@@ -167,7 +166,7 @@ def compute_bbox_by_cam_frustrm(args, cfg, HW, Ks, poses, i_train, near, far, **
     xyz_min = torch.Tensor([np.inf, np.inf, np.inf])
     xyz_max = -xyz_min
     for (H, W), K, c2w in zip(HW[i_train], Ks[i_train], poses[i_train]):
-        rays_o, rays_d, viewdirs = dvgo.get_rays_of_a_view(
+        rays_o, rays_d, viewdirs, radii = dvgo.get_rays_of_a_view(
                 H=H, W=W, K=K, c2w=c2w,
                 ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
                 flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
@@ -478,7 +477,7 @@ if __name__=='__main__':
         near, far = data_dict['near'], data_dict['far']
         cam_lst = []
         for c2w, (H, W), K in zip(poses[i_train], HW[i_train], Ks[i_train]):
-            rays_o, rays_d, viewdirs = dvgo.get_rays_of_a_view(
+            rays_o, rays_d, viewdirs, radii = dvgo.get_rays_of_a_view(
                     H, W, K, c2w, cfg.data.ndc, inverse_y=cfg.data.inverse_y,
                     flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y,)
             cam_o = rays_o[0,0].cpu().numpy()
