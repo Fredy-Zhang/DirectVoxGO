@@ -249,8 +249,10 @@ class DirectVoxGO(torch.nn.Module):
             return ret_lst[0]
         return ret_lst
 
-    def sample_ray(self, rays_o, rays_d, near, far, stepsize, is_train=False, **render_kwargs):
+    def sample_ray(self, rays_o, rays_d, radii, near, far, stepsize, is_train=False, **render_kwargs):
         '''Sample query points on rays'''
+        import pdb
+        pdb.set_trace()
         # 1. determine the maximum number of query points to cover all possible rays
         N_samples = int(np.linalg.norm(np.array(self.density.shape[2:])+1) / stepsize) + 1
         # 2. determine the two end-points of ray bbox intersection
@@ -273,14 +275,14 @@ class DirectVoxGO(torch.nn.Module):
         mask_outbbox = mask_outbbox[...,None] | ((self.xyz_min>rays_pts) | (rays_pts>self.xyz_max)).any(dim=-1)
         return rays_pts, mask_outbbox
 
-    def forward(self, rays_o, rays_d, viewdirs, global_step=None, **render_kwargs):
+    def forward(self, rays_o, rays_d, viewdirs, radii, global_step=None, **render_kwargs):
         '''Volume rendering'''
 
         ret_dict = {}
 
         # sample points on rays
         rays_pts, mask_outbbox = self.sample_ray(
-                rays_o=rays_o, rays_d=rays_d, is_train=global_step is not None, **render_kwargs)
+                rays_o=rays_o, rays_d=rays_d, radii=radii, is_train=global_step is not None, **render_kwargs)
         interval = render_kwargs['stepsize'] * self.voxel_size_ratio
 
         # update mask for query points in known free space
@@ -452,8 +454,8 @@ def get_rays(H, W, K, c2w, inverse_y, flip_x, flip_y, mode='center'):
     rays_o = c2w[:3,3].expand(rays_d.shape)
 
     '''
-    ZZK: Adding radii calculation process.
-	return the radius of each pixel (800*800)
+        ZZK: Adding radii calculation process.
+          return the radius of each pixel (800*800)
     '''
     # dx = [
     #     np.sqrt(np.sum((v[:-1, :, :] - v[1:, :, :])**2, -1)) for v in rays_d
@@ -467,7 +469,7 @@ def get_rays(H, W, K, c2w, inverse_y, flip_x, flip_y, mode='center'):
 
     radii = dx[..., None] * 2 / np.sqrt(12)  # return the radius of each pixel (800*800)
 
-    return rays_o, rays_d, radii
+    return rays_o, rays_d, torch.squeeze(radii)
 
 
 def get_rays_np(H, W, K, c2w):
@@ -501,8 +503,8 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
 
 
 def get_rays_of_a_view(H, W, K, c2w, ndc, inverse_y, flip_x, flip_y, mode='center'):
-    import pdb
-    pdb.set_trace()
+    # import pdb
+    # pdb.set_trace()
     rays_o, rays_d, radii = get_rays(H, W, K, c2w, inverse_y=inverse_y, flip_x=flip_x, flip_y=flip_y, mode=mode)
     viewdirs = rays_d / rays_d.norm(dim=-1, keepdim=True)
     if ndc:
@@ -518,10 +520,11 @@ def get_training_rays(rgb_tr, train_poses, HW, Ks, ndc, inverse_y, flip_x, flip_
     assert len(rgb_tr) == len(train_poses) and len(rgb_tr) == len(Ks) and len(rgb_tr) == len(HW)
     H, W = HW[0]
     K = Ks[0]
-    eps_time = time.time()
-    rays_o_tr = torch.zeros([len(rgb_tr), H, W, 3], device=rgb_tr.device)
-    rays_d_tr = torch.zeros([len(rgb_tr), H, W, 3], device=rgb_tr.device)
+    eps_time    = time.time()
+    rays_o_tr   = torch.zeros([len(rgb_tr), H, W, 3], device=rgb_tr.device)
+    rays_d_tr   = torch.zeros([len(rgb_tr), H, W, 3], device=rgb_tr.device)
     viewdirs_tr = torch.zeros([len(rgb_tr), H, W, 3], device=rgb_tr.device)
+    radii_tr    = torch.zeros([len(rgb_tr), H, W], device=rgb_tr.device)
     imsz = [1] * len(rgb_tr)
     for i, c2w in enumerate(train_poses):
         rays_o, rays_d, viewdirs, radii = get_rays_of_a_view(
@@ -529,10 +532,11 @@ def get_training_rays(rgb_tr, train_poses, HW, Ks, ndc, inverse_y, flip_x, flip_
         rays_o_tr[i].copy_(rays_o.to(rgb_tr.device))
         rays_d_tr[i].copy_(rays_d.to(rgb_tr.device))
         viewdirs_tr[i].copy_(viewdirs.to(rgb_tr.device))
-        del rays_o, rays_d, viewdirs
+        radii_tr[i].copy_(radii.to(rgb_tr.device))
+        del rays_o, rays_d, viewdirs, radii
     eps_time = time.time() - eps_time
     print('get_training_rays: finish (eps time:', eps_time, 'sec)')
-    return rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz
+    return rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz, radii_tr
 
 
 @torch.no_grad()
@@ -546,6 +550,7 @@ def get_training_rays_flatten(rgb_tr_ori, train_poses, HW, Ks, ndc, inverse_y, f
     rays_o_tr = torch.zeros_like(rgb_tr)
     rays_d_tr = torch.zeros_like(rgb_tr)
     viewdirs_tr = torch.zeros_like(rgb_tr)
+    radii_tr = torch.zeros(N, device=DEVICE)
     imsz = []
     top = 0
     for c2w, img, (H, W), K in zip(train_poses, rgb_tr_ori, HW, Ks):
@@ -558,13 +563,14 @@ def get_training_rays_flatten(rgb_tr_ori, train_poses, HW, Ks, ndc, inverse_y, f
         rays_o_tr[top:top+n].copy_(rays_o.flatten(0,1).to(DEVICE))
         rays_d_tr[top:top+n].copy_(rays_d.flatten(0,1).to(DEVICE))
         viewdirs_tr[top:top+n].copy_(viewdirs.flatten(0,1).to(DEVICE))
+        radii_tr[top:top+n].copy_(radii.flatten(0,1).to(DEVICE))
         imsz.append(n)
         top += n
 
     assert top == N
     eps_time = time.time() - eps_time
     print('get_training_rays_flatten: finish (eps time:', eps_time, 'sec)')
-    return rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz
+    return rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz, radii_tr
 
 
 @torch.no_grad()
@@ -579,6 +585,7 @@ def get_training_rays_in_maskcache_sampling(rgb_tr_ori, train_poses, HW, Ks, ndc
     rays_o_tr = torch.zeros_like(rgb_tr)
     rays_d_tr = torch.zeros_like(rgb_tr)
     viewdirs_tr = torch.zeros_like(rgb_tr)
+    radii_tr = torch.zeros(N, device=DEVICE)
     imsz = []
     top = 0
     for c2w, img, (H, W), K in zip(train_poses, rgb_tr_ori, HW, Ks):
@@ -589,7 +596,7 @@ def get_training_rays_in_maskcache_sampling(rgb_tr_ori, train_poses, HW, Ks, ndc
         mask = torch.ones(img.shape[:2], device=DEVICE, dtype=torch.bool)
         for i in range(0, img.shape[0], CHUNK):
             rays_pts, mask_outbbox = model.sample_ray(
-                    rays_o=rays_o[i:i+CHUNK], rays_d=rays_d[i:i+CHUNK], **render_kwargs)
+                    rays_o=rays_o[i:i+CHUNK], rays_d=rays_d[i:i+CHUNK], radii=radii[i:i+CHUNK] **render_kwargs)
             mask_outbbox[~mask_outbbox] |= (~model.mask_cache(rays_pts[~mask_outbbox]))
             mask[i:i+CHUNK] &= (~mask_outbbox).any(-1).to(DEVICE)
         n = mask.sum()
@@ -597,6 +604,7 @@ def get_training_rays_in_maskcache_sampling(rgb_tr_ori, train_poses, HW, Ks, ndc
         rays_o_tr[top:top+n].copy_(rays_o[mask].to(DEVICE))
         rays_d_tr[top:top+n].copy_(rays_d[mask].to(DEVICE))
         viewdirs_tr[top:top+n].copy_(viewdirs[mask].to(DEVICE))
+        radii_tr[top:top+n].copy_(radii[mask].to(DEVICE))
         imsz.append(n)
         top += n
 
@@ -605,9 +613,10 @@ def get_training_rays_in_maskcache_sampling(rgb_tr_ori, train_poses, HW, Ks, ndc
     rays_o_tr = rays_o_tr[:top]
     rays_d_tr = rays_d_tr[:top]
     viewdirs_tr = viewdirs_tr[:top]
+    radii_tr = radii_tr[:top]
     eps_time = time.time() - eps_time
     print('get_training_rays_in_maskcache_sampling: finish (eps time:', eps_time, 'sec)')
-    return rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz
+    return rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz, radii_tr
 
 
 def batch_indices_generator(N, BS):
