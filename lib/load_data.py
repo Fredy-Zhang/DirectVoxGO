@@ -12,6 +12,7 @@ from .load_co3d import load_co3d_data
 def load_data(args):
 
     K, depths = None, None
+    image_plane_ratio = 1.0
 
     if args.dataset_type == 'llff':
         images, depths, poses, bds, render_poses, i_test = load_llff_data(
@@ -62,6 +63,8 @@ def load_data(args):
 
         near, far = inward_nearfar_heuristic(poses[i_train, :3, 3])
 
+        image_plane_ratio = 0.05 * image_plane_ratio
+
         assert images.shape[-1] == 3
 
     elif args.dataset_type == 'tankstemple':
@@ -70,6 +73,9 @@ def load_data(args):
         i_train, i_val, i_test = i_split
 
         near, far = inward_nearfar_heuristic(poses[i_train, :3, 3], ratio=0)
+        ## near: 0.0; far: 5.6711187;
+
+        image_plane_ratio = -0.05 * image_plane_ratio
 
         if images.shape[-1] == 4:
             if args.white_bkgd:
@@ -83,6 +89,8 @@ def load_data(args):
         i_train, i_val, i_test = i_split
 
         near, far = inward_nearfar_heuristic(poses[i_train, :3, 3])
+
+        image_plane_ratio = 0.05 * image_plane_ratio
 
         if images.shape[-1] == 4:
             if args.white_bkgd:

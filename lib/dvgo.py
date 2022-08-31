@@ -232,27 +232,70 @@ class DirectVoxGO(torch.nn.Module):
         interval = interval if interval is not None else self.voxel_size_ratio
         return 1 - torch.exp(-F.softplus(density + self.act_shift) * interval)
 
-    def grid_sampler(self, xyz, *grids, mode=None, align_corners=True):
+    def grid_sampler(self, xyz, *grids, lower=None, upper=None, mip_weights=None, mode=None, align_corners=True):
         '''Wrapper for the interp operation'''
         if mode is None:
             # bilinear is actually trilinear if 5D input is given to grid_sample
             mode = 'nearest' if self.nearest else 'bilinear'
-        shape = xyz.shape[:-1]
-        xyz = xyz.reshape(1,1,1,-1,3)
-        ind_norm = ((xyz - self.xyz_min) / (self.xyz_max - self.xyz_min)).flip((-1,)) * 2 - 1
-        ret_lst = [
-            # TODO: use `rearrange' to make it readable
-            F.grid_sample(grid, ind_norm, mode=mode, align_corners=align_corners).reshape(grid.shape[1],-1).T.reshape(*shape,grid.shape[1]).squeeze()
-            for grid in grids
-        ]
-        if len(ret_lst) == 1:
-            return ret_lst[0]
-        return ret_lst
+
+        '''
+            ZZK: adding the mipmap components for this density grids.
+            *grids: torch.Size([1, 1, 107, 107, 88])
+            xyz   : torch.Size([1485936, 3])
+            
+        (Pdb) pp ind_norm
+           tensor([[[[[ 0.7517,  0.3399, -0.2344],
+                [ 0.7405,  0.3391, -0.2357],
+                [ 0.7293,  0.3384, -0.2370],
+                ...,
+                [-0.3249,  0.1326,  0.9762],
+                [-0.3274,  0.1343,  0.9851],
+                [-0.3299,  0.1360,  0.9940]]]]])
+        (Pdb) pp xyz
+           tensor([[[[[-0.7114,  1.0275,  1.7254],
+                [-0.7154,  1.0252,  1.6979],
+                [-0.7193,  1.0229,  1.6703],
+                ...,
+                [ 2.9337,  0.4030, -0.9294],
+                [ 2.9604,  0.4082, -0.9356],
+                [ 2.9872,  0.4135, -0.9417]]]]])
+        torch.nn.functional.interpolate : Down/up samples the input to either the given size or the given scale_factor.
+        nearest, linear (3D-only), bilinear, bicubic (4D-only), trilinear (5D-only), area, nearest-exact.
+        '''
+        if lower is None and upper is None:
+            ## following the original way
+            shape = xyz.shape[:-1]
+            xyz = xyz.reshape(1,1,1,-1,3)
+            ind_norm = ((xyz - self.xyz_min) / (self.xyz_max - self.xyz_min)).flip((-1,)) * 2 - 1
+            ret_lst = [
+                # TODO: use `rearrange' to make it readable
+                F.grid_sample(grid, ind_norm, mode=mode, align_corners=align_corners).reshape(grid.shape[1],-1).T.reshape(*shape,grid.shape[1]).squeeze()
+                for grid in grids
+            ]
+            if len(ret_lst) == 1:
+                return ret_lst[0]
+            return ret_lst
+        else:
+            '''
+               ZZK: at the first stage, because we use the F.interpolate(mode="trilinear"), which only support 
+                 "anti-alias" for "bilinear" or "bicubic".
+                 In this way, I calculating the mip-map without using "anti-alias" at first.
+                 Getting the point x, surrounding voxels following the lower number and upper number.  
+            '''
+            shape = xyz.shape[:-1]
+            xyz = xyz.reshape(1, 1, 1, -1, 3)
+            ind_norm = ((xyz - self.xyz_min) / (self.xyz_max - self.xyz_min)).flip((-1,)) * 2 - 1
+            ret_lst = [
+                # TODO: use `rearrange' to make it readable
+                F.grid_sample(grid, ind_norm, mode=mode, align_corners=align_corners).reshape(grid.shape[1],-1).T.reshape(*shape,grid.shape[1]).squeeze()
+                for grid in grids
+            ]
+            if len(ret_lst) == 1:
+                return ret_lst[0]
+            return ret_lst
 
     def sample_ray(self, rays_o, rays_d, radii, near, far, stepsize, is_train=False, **render_kwargs):
         '''Sample query points on rays'''
-        import pdb
-        pdb.set_trace()
         # 1. determine the maximum number of query points to cover all possible rays
         N_samples = int(np.linalg.norm(np.array(self.density.shape[2:])+1) / stepsize) + 1
         # 2. determine the two end-points of ray bbox intersection
@@ -271,17 +314,37 @@ class DirectVoxGO(torch.nn.Module):
         step = stepsize * self.voxel_size * rng
         interpx = (t_min[...,None] + step/rays_d.norm(dim=-1,keepdim=True))
         rays_pts = rays_o[...,None,:] + rays_d[...,None,:] * interpx[...,None]
+
+        '''
+            ZZK: adding the new Tensor to describe each point in the ray need to consider how many 
+                   neighbors in Voxel Grids.
+                The number of voxels are determined by the depth of the point. 
+                Assume point x is o+td, the image plane is o+pd, the camera is o.
+                distance((o+td)-o)/(distance((o+pd)-o) --> t/p.
+                if p=1, the number of voxels in t are t/1.
+        '''
+        # return the shape of (60, 800, 354)
+        # _x = torch.linalg.norm(rays_pts-torch.transpose(torch.broadcast_to(rays_o, (rays_pts.shape)), 0, 1), axis=2)
+        # _d = torch.transpose(torch.broadcast_to(torch.norm(rays_d, dim=1), (rays_pts.shape[1], rays_d.shape[0])), 0,1)
+        # rays_ngr_lower = (_x/_d).type(torch.int)
+        # rays_ngr_upper = (rays_ngr_lower + torch.ones_like(rays_ngr_lower)).type(torch.int)
+        ## actually, compare the depth to get the voxels number, just consider the interpx.
+        rays_ngr_lower = interpx.type(torch.int)
+        rays_ngr_weights = interpx - rays_ngr_lower
+        rays_ngr_upper = (rays_ngr_lower + torch.ones_like(rays_ngr_lower)).type(torch.int)
         # 5. update mask for query points outside bbox
         mask_outbbox = mask_outbbox[...,None] | ((self.xyz_min>rays_pts) | (rays_pts>self.xyz_max)).any(dim=-1)
-        return rays_pts, mask_outbbox
+        return rays_pts, mask_outbbox, rays_ngr_lower, rays_ngr_upper, rays_ngr_weights
 
     def forward(self, rays_o, rays_d, viewdirs, radii, global_step=None, **render_kwargs):
         '''Volume rendering'''
+        import pdb
+        pdb.set_trace()
 
         ret_dict = {}
 
         # sample points on rays
-        rays_pts, mask_outbbox = self.sample_ray(
+        rays_pts, mask_outbbox, lower, upper, mip_weights = self.sample_ray(
                 rays_o=rays_o, rays_d=rays_d, radii=radii, is_train=global_step is not None, **render_kwargs)
         interval = render_kwargs['stepsize'] * self.voxel_size_ratio
 
@@ -294,14 +357,20 @@ class DirectVoxGO(torch.nn.Module):
         if self.pre_act_density:
             # pre-activation
             alpha[~mask_outbbox] = self.grid_sampler(
-                    rays_pts[~mask_outbbox], self.activate_density(self.density, interval))
+                    rays_pts[~mask_outbbox], self.activate_density(self.density, interval),
+                    lower=lower[~mask_outbbox], upper=upper[~mask_outbbox],
+                    mip_weights=mip_weights[~mask_outbbox])
         elif self.in_act_density:
             # in-activation
-            density = self.grid_sampler(rays_pts[~mask_outbbox], F.softplus(self.density + self.act_shift))
+            density = self.grid_sampler(rays_pts[~mask_outbbox], F.softplus(self.density + self.act_shift),
+                                        lower=lower[~mask_outbbox], upper=upper[~mask_outbbox],
+                                        mip_weights=mip_weights[~mask_outbbox])
             alpha[~mask_outbbox] = 1 - torch.exp(-density * interval)
         else:
             # post-activation
-            density = self.grid_sampler(rays_pts[~mask_outbbox], self.density)
+            density = self.grid_sampler(rays_pts[~mask_outbbox], self.density,
+                                        lower=lower[~mask_outbbox], upper=upper[~mask_outbbox],
+                                        mip_weights=mip_weights[~mask_outbbox])
             alpha[~mask_outbbox] = self.activate_density(density, interval)
 
         # compute accumulated transmittance
@@ -311,7 +380,9 @@ class DirectVoxGO(torch.nn.Module):
         mask = (weights > self.fast_color_thres)
         k0 = torch.zeros(*weights.shape, self.k0_dim).to(weights)
         if not self.rgbnet_full_implicit:
-            k0[mask] = self.grid_sampler(rays_pts[mask], self.k0)
+            k0[mask] = self.grid_sampler(rays_pts[mask], self.k0,
+                                         lower=lower[mask], upper=upper[mask],
+                                         mip_weights=mip_weights[~mask_outbbox])
 
         if self.rgbnet is None:
             # no view-depend effect
@@ -456,6 +527,13 @@ def get_rays(H, W, K, c2w, inverse_y, flip_x, flip_y, mode='center'):
     '''
         ZZK: Adding radii calculation process.
           return the radius of each pixel (800*800)
+          Based on the defination from Mip-Nerf, 
+            1. the apex of that cone lies at rays_o;
+            2. the radius of the cone at the image plane [rays_o + rays_d] is parameterized as dot_r;
+            3. setting the dot_r to the width of the pixel in world coordinates scaled by 2/sqrt(12).
+          using the similar triangles: (r/2):(x_r/2) = 
+                        (distance((rays_o+rays_d) <--> rays_o)) : (distance(rays_pts <--> rays_o))
+            Getting the x_r value, x_r / r to get the number of voxels need to be used.
     '''
     # dx = [
     #     np.sqrt(np.sum((v[:-1, :, :] - v[1:, :, :])**2, -1)) for v in rays_d
@@ -503,8 +581,6 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
 
 
 def get_rays_of_a_view(H, W, K, c2w, ndc, inverse_y, flip_x, flip_y, mode='center'):
-    # import pdb
-    # pdb.set_trace()
     rays_o, rays_d, radii = get_rays(H, W, K, c2w, inverse_y=inverse_y, flip_x=flip_x, flip_y=flip_y, mode=mode)
     viewdirs = rays_d / rays_d.norm(dim=-1, keepdim=True)
     if ndc:
@@ -595,8 +671,8 @@ def get_training_rays_in_maskcache_sampling(rgb_tr_ori, train_poses, HW, Ks, ndc
                 inverse_y=inverse_y, flip_x=flip_x, flip_y=flip_y)
         mask = torch.ones(img.shape[:2], device=DEVICE, dtype=torch.bool)
         for i in range(0, img.shape[0], CHUNK):
-            rays_pts, mask_outbbox = model.sample_ray(
-                    rays_o=rays_o[i:i+CHUNK], rays_d=rays_d[i:i+CHUNK], radii=radii[i:i+CHUNK] **render_kwargs)
+            rays_pts, mask_outbbox, lower, upper, mip_weights = model.sample_ray(
+                    rays_o=rays_o[i:i+CHUNK], rays_d=rays_d[i:i+CHUNK], radii=radii[i:i+CHUNK], **render_kwargs)
             mask_outbbox[~mask_outbbox] |= (~model.mask_cache(rays_pts[~mask_outbbox]))
             mask[i:i+CHUNK] &= (~mask_outbbox).any(-1).to(DEVICE)
         n = mask.sum()

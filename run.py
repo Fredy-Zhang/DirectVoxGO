@@ -82,7 +82,7 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
                 flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
         keys = ['rgb_marched', 'disp']
         render_result_chunks = [
-            {k: v for k, v in model(ro, rd, vd, **render_kwargs).items() if k in keys}
+            {k: v for k, v in model(ro, rd, vd, None, **render_kwargs).items() if k in keys}
             for ro, rd, vd in zip(rays_o.split(16, 0), rays_d.split(16, 0), viewdirs.split(16, 0))
         ]
         render_result = {
@@ -315,8 +315,8 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
     time0 = time.time()
     global_step = -1
     for global_step in trange(1+start, 1+cfg_train.N_iters):
-        import pdb
-        pdb.set_trace()
+        #import pdb
+        #pdb.set_trace()
         # progress scaling checkpoint
         if global_step in cfg_train.pg_scale:
             model.scale_volume_grid(model.num_voxels * 2)
